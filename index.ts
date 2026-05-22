@@ -1,0 +1,1104 @@
+/**
+ * pi-todo — Stateful to-do extension for pi.
+ *
+ * Two surfaces:
+ *  1. Recited list (compact, injected every turn via the `context` event)
+ *  2. Per-item detail (addressable via todo_get, full detail only for in_progress)
+ *
+ * Persistence: .pi/pi-todo.md (project-local markdown file).
+ * UI: persistent top-right overlay panel (auto-shows/hides with todo state).
+ */
+
+import { StringEnum } from "@earendil-works/pi-ai";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	Theme,
+} from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import {
+	readFileSync,
+	writeFileSync,
+	existsSync,
+	appendFileSync,
+	mkdirSync,
+	unlinkSync,
+} from "node:fs";
+import { join, resolve } from "node:path";
+import {
+	matchesKey,
+	Text,
+	Container,
+	Spacer,
+	type SelectItem,
+	SelectList,
+	type Component,
+	truncateToWidth,
+	type OverlayHandle,
+	type TUI,
+} from "@earendil-works/pi-tui";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+
+// ─── Data Model ───────────────────────────────────────────────────────────────
+
+type Status = "pending" | "in_progress" | "completed";
+
+interface TodoDetail {
+	definitionOfDone?: string;
+	constraints?: string[];
+	refs?: string[];
+	deps?: string[];
+	rationale?: string;
+	nextStep?: string;
+}
+
+interface TodoItem {
+	id: string;
+	headline: string;
+	status: Status;
+	detail?: TodoDetail;
+}
+
+interface TodoList {
+	items: TodoItem[];
+}
+
+// ─── Persistence ──────────────────────────────────────────────────────────────
+
+const TODO_FILE = "pi-todo.md";
+const DONE_FILE = "pi-todo.done.md";
+
+function getPiDir(cwd: string): string {
+	return resolve(cwd, ".pi");
+}
+
+function getTodoPath(cwd: string): string {
+	return join(getPiDir(cwd), TODO_FILE);
+}
+
+function getDonePath(cwd: string): string {
+	return join(getPiDir(cwd), DONE_FILE);
+}
+
+/**
+ * Serialize a TodoList to markdown.
+ */
+function serializeTodoList(list: TodoList): string {
+	const lines: string[] = ["# Todo List", ""];
+
+	for (const item of list.items) {
+		const marker =
+			item.status === "completed"
+				? "[x]"
+				: item.status === "in_progress"
+					? "[>]"
+					: "[ ]";
+		lines.push(`- ${marker} ${item.id}: ${item.headline}`);
+
+		if (item.detail) {
+			const d = item.detail;
+			if (d.definitionOfDone)
+				lines.push(`  - definitionOfDone: ${d.definitionOfDone}`);
+			if (d.constraints?.length) {
+				for (const c of d.constraints) lines.push(`  - constraints: ${c}`);
+			}
+			if (d.refs?.length) {
+				for (const r of d.refs) lines.push(`  - refs: ${r}`);
+			}
+			if (d.deps?.length) {
+				for (const dep of d.deps) lines.push(`  - deps: ${dep}`);
+			}
+			if (d.rationale) lines.push(`  - rationale: ${d.rationale}`);
+			if (d.nextStep) lines.push(`  - nextStep: ${d.nextStep}`);
+		}
+		lines.push("");
+	}
+
+	return lines.join("\n");
+}
+
+/**
+ * Parse a markdown todo file back into a TodoList.
+ */
+function parseTodoList(content: string): TodoList {
+	const items: TodoItem[] = [];
+	const lines = content.split("\n");
+	let current: TodoItem | null = null;
+
+	for (const rawLine of lines) {
+		const line = rawLine;
+
+		// Match todo item line: "- [x] t1: headline" or "- [>] t1: headline" or "- [ ] t1: headline"
+		const itemMatch = line.match(/^-\s+\[([x> ])\]\s+(\S+):\s+(.+)$/);
+		if (itemMatch) {
+			if (current) items.push(current);
+			const marker = itemMatch[1];
+			const status: Status =
+				marker === "x"
+					? "completed"
+					: marker === ">"
+						? "in_progress"
+						: "pending";
+			current = {
+				id: itemMatch[2],
+				headline: itemMatch[3],
+				status,
+				detail: {},
+			};
+			continue;
+		}
+
+		// Match detail sub-bullet: "  - key: value"
+		if (current) {
+			const detailMatch = line.match(/^\s+-\s+(\w+):\s+(.+)$/);
+			if (detailMatch) {
+				const key = detailMatch[1] as keyof TodoDetail;
+				const value = detailMatch[2];
+				if (!current.detail) current.detail = {};
+				if (key === "constraints" || key === "refs" || key === "deps") {
+					const arr = current.detail[key] as string[] | undefined;
+					if (arr) {
+						arr.push(value);
+					} else {
+						(current.detail as any)[key] = [value];
+					}
+				} else {
+					(current.detail as any)[key] = value;
+				}
+			}
+		}
+	}
+
+	if (current) items.push(current);
+	return { items };
+}
+
+function loadTodoList(cwd: string): TodoList {
+	const path = getTodoPath(cwd);
+	if (!existsSync(path)) return { items: [] };
+	const content = readFileSync(path, "utf-8");
+	return parseTodoList(content);
+}
+
+function saveTodoList(cwd: string, list: TodoList): void {
+	const piDir = getPiDir(cwd);
+	if (!existsSync(piDir)) mkdirSync(piDir, { recursive: true });
+	const path = getTodoPath(cwd);
+	writeFileSync(path, serializeTodoList(list), "utf-8");
+}
+
+function retireTodoList(cwd: string): void {
+	const todoPath = getTodoPath(cwd);
+	const donePath = getDonePath(cwd);
+	if (!existsSync(todoPath)) return;
+
+	const content = readFileSync(todoPath, "utf-8");
+	const timestamp = new Date().toISOString();
+	const header = `## Completed: ${timestamp}\n\n`;
+
+	const piDir = getPiDir(cwd);
+	if (!existsSync(piDir)) mkdirSync(piDir, { recursive: true });
+	appendFileSync(donePath, header + content + "\n\n", "utf-8");
+
+	unlinkSync(todoPath);
+}
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+interface TodoConfig {
+	strictDeps: boolean;
+	shortListThreshold: number;
+	shortDetailMaxLen: number;
+}
+
+const DEFAULT_CONFIG: TodoConfig = {
+	strictDeps: false,
+	shortListThreshold: 5,
+	shortDetailMaxLen: 120,
+};
+
+// ─── Recitation ───────────────────────────────────────────────────────────────
+
+/**
+ * Build the recited block for injection into context.
+ * Compact list + active item detail (or short-list lookahead).
+ */
+function buildRecitation(list: TodoList, config: TodoConfig): string {
+	if (list.items.length === 0) return "";
+
+	const lines: string[] = ["## Active Todo List"];
+
+	const inProgress = list.items.find((i) => i.status === "in_progress");
+
+	// Short-list lookahead: when list is small and details are terse
+	const useLookahead =
+		list.items.length <= config.shortListThreshold &&
+		list.items.every(
+			(item) =>
+				!item.detail ||
+				!item.detail.nextStep ||
+				item.detail.nextStep.length <= config.shortDetailMaxLen,
+		);
+
+	for (const item of list.items) {
+		const icon =
+			item.status === "completed"
+				? "✅"
+				: item.status === "in_progress"
+					? "▶️"
+					: "⬜";
+		lines.push(`${icon} ${item.id}: ${item.headline}`);
+
+		// Inline nextStep for short lists
+		if (useLookahead && item.detail?.nextStep && item.status !== "completed") {
+			lines.push(`  → ${item.detail.nextStep}`);
+		}
+	}
+
+	// Full detail for in_progress item
+	if (inProgress?.detail) {
+		lines.push("");
+		lines.push(`### Detail: ${inProgress.id} (${inProgress.headline})`);
+		const d = inProgress.detail;
+		if (d.definitionOfDone) lines.push(`- **DoD**: ${d.definitionOfDone}`);
+		if (d.constraints?.length)
+			lines.push(`- **Constraints**: ${d.constraints.join("; ")}`);
+		if (d.refs?.length) lines.push(`- **Refs**: ${d.refs.join(", ")}`);
+		if (d.deps?.length) lines.push(`- **Deps**: ${d.deps.join(", ")}`);
+		if (d.rationale) lines.push(`- **Rationale**: ${d.rationale}`);
+		if (d.nextStep) lines.push(`- **Next**: ${d.nextStep}`);
+	}
+
+	lines.push("");
+	return lines.join("\n");
+}
+
+// ─── Persistent Overlay Component ─────────────────────────────────────────────
+
+/**
+ * Compact todo panel rendered as a right-anchored overlay.
+ * Auto-hides when there are no todos.
+ */
+class TodoOverlay implements Component {
+	private items: TodoItem[];
+	private theme: Theme;
+	private cachedWidth?: number;
+	private cachedLines?: string[];
+
+	constructor(items: TodoItem[], theme: Theme) {
+		this.items = items;
+		this.theme = theme;
+	}
+
+	/** Update items in-place (avoids recreating the component) */
+	update(items: TodoItem[]): void {
+		this.items = items;
+		this.invalidate();
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
+
+	render(width: number): string[] {
+		if (this.cachedLines && this.cachedWidth === width) {
+			return this.cachedLines;
+		}
+
+		const th = this.theme;
+		const lines: string[] = [];
+
+		// Top border with title
+		const title = th.fg("accent", " TODO ");
+		const inner = Math.max(0, width - 2);
+		const remaining = Math.max(0, inner - 6);
+		lines.push(
+			th.fg("borderMuted", "╭─") +
+				title +
+				th.fg("borderMuted", "─".repeat(remaining) + "╮"),
+		);
+
+		const done = this.items.filter((i) => i.status === "completed").length;
+		const total = this.items.length;
+		lines.push(
+			th.fg("borderMuted", "│ ") +
+				th.fg("dim", `${done}/${total}`) +
+				th.fg("borderMuted", " │"),
+		);
+
+		for (const item of this.items) {
+			const icon =
+				item.status === "completed"
+					? th.fg("success", "✅")
+					: item.status === "in_progress"
+						? th.fg("accent", "▶")
+						: th.fg("dim", "○");
+			const id = th.fg("accent", item.id);
+			const text =
+				item.status === "completed"
+					? th.fg("dim", item.headline)
+					: th.fg("text", item.headline);
+			const line = `${icon} ${id} ${text}`;
+			const padded = truncateToWidth(line, Math.max(4, width - 4), "", true);
+			lines.push(
+				th.fg("borderMuted", "│ ") + padded + th.fg("borderMuted", " │"),
+			);
+		}
+
+		// Bottom border
+		const bottomInner = Math.max(0, width - 2);
+		lines.push(th.fg("borderMuted", "╰" + "─".repeat(bottomInner) + "╯"));
+
+		this.cachedWidth = width;
+		this.cachedLines = lines;
+		return lines;
+	}
+}
+
+// ─── Extension ────────────────────────────────────────────────────────────────
+
+export default function (pi: ExtensionAPI) {
+	let todoList: TodoList = { items: [] };
+	const config: TodoConfig = { ...DEFAULT_CONFIG };
+	let cwd: string = "";
+
+	// Persistent overlay state
+	let overlayHandle: OverlayHandle | null = null;
+	let overlayTui: TUI | null = null;
+	let overlayComponent: TodoOverlay | null = null;
+
+	/** Load from file and set in-memory state */
+	const loadState = (ctx: ExtensionContext) => {
+		cwd = ctx.cwd;
+		todoList = loadTodoList(cwd);
+	};
+
+	/** Save in-memory state to file */
+	const saveState = () => {
+		if (cwd) saveTodoList(cwd, todoList);
+	};
+
+	/** Enforce single in_progress invariant */
+	const enforceSingleInProgress = () => {
+		const inProgressIds = todoList.items
+			.filter((i) => i.status === "in_progress")
+			.map((i) => i.id);
+		if (inProgressIds.length > 1) {
+			for (let i = 1; i < inProgressIds.length; i++) {
+				const item = todoList.items.find((it) => it.id === inProgressIds[i]);
+				if (item) item.status = "pending";
+			}
+		}
+	};
+
+	/** Check deps for an item. Returns unmet dep IDs or empty array. */
+	const checkDeps = (item: TodoItem): string[] => {
+		if (!item.detail?.deps?.length) return [];
+		const completedIds = new Set(
+			todoList.items.filter((i) => i.status === "completed").map((i) => i.id),
+		);
+		return item.detail.deps.filter((dep) => !completedIds.has(dep));
+	};
+
+	/** Refresh the overlay panel with current state. Creates it if needed. */
+	const refreshOverlay = (ctx?: ExtensionContext) => {
+		if (todoList.items.length === 0) {
+			if (overlayHandle) {
+				overlayHandle.hide();
+				overlayHandle = null;
+			}
+			overlayTui = null;
+			overlayComponent = null;
+		} else if (overlayComponent && overlayTui) {
+			// Overlay exists — update in place
+			overlayComponent.update(todoList.items);
+			overlayTui.requestRender();
+		} else if (ctx && ctx.hasUI) {
+			// No overlay yet — create one
+			ctx.ui.custom<void>(
+				(tui, theme, _kb, _done) => {
+					overlayTui = tui;
+					overlayComponent = new TodoOverlay(todoList.items, theme);
+					return overlayComponent;
+				},
+				{
+					overlay: true,
+					overlayOptions: {
+						anchor: "top-right" as const,
+						width: "40%",
+						minWidth: 30,
+						margin: 1,
+						nonCapturing: true,
+					},
+					onHandle: (handle) => {
+						overlayHandle = handle;
+					},
+				},
+			);
+		}
+	};
+
+	// ─── Session lifecycle ──────────────────────────────────────────────────
+
+	pi.on("session_start", async (_event, ctx) => {
+		loadState(ctx);
+		enforceSingleInProgress();
+
+		// Show persistent overlay if there are todos
+		if (todoList.items.length > 0 && ctx.hasUI) {
+			ctx.ui.custom<void>(
+				(tui, theme, _kb, _done) => {
+					overlayTui = tui;
+					overlayComponent = new TodoOverlay(todoList.items, theme);
+					return overlayComponent;
+				},
+				{
+					overlay: true,
+					overlayOptions: {
+						anchor: "top-right" as const,
+						width: "40%",
+						minWidth: 30,
+						margin: 1,
+						nonCapturing: true,
+					},
+					onHandle: (handle) => {
+						overlayHandle = handle;
+					},
+				},
+			);
+		}
+
+		// Status indicator
+		const inProgress = todoList.items.find((i) => i.status === "in_progress");
+		if (inProgress) {
+			ctx.ui.setStatus("pi-todo", `▶ ${inProgress.id}: ${inProgress.headline}`);
+		} else if (todoList.items.length > 0) {
+			ctx.ui.setStatus("pi-todo", `${todoList.items.length} todo(s)`);
+		}
+	});
+
+	pi.on("session_shutdown", async (_event, _ctx) => {
+		if (cwd) saveState();
+		if (overlayHandle) {
+			overlayHandle.hide();
+			overlayHandle = null;
+		}
+		overlayTui = null;
+		overlayComponent = null;
+	});
+
+	// ─── Per-turn recitation ────────────────────────────────────────────────
+
+	pi.on("context", async (event, _ctx) => {
+		if (todoList.items.length === 0) return;
+
+		const recitation = buildRecitation(todoList, config);
+		if (!recitation) return;
+
+		const messages = [...event.messages];
+		messages.push({
+			role: "user",
+			content: [{ type: "text", text: recitation }],
+			timestamp: Date.now(),
+		} as any);
+
+		return { messages };
+	});
+
+	// ─── Tools ──────────────────────────────────────────────────────────────
+
+	// todo_write: create/replace list or upsert items
+	pi.registerTool({
+		name: "todo_write",
+		label: "Todo Write",
+		description:
+			"Create or update todo items. Use for multi-step, multi-tool, or long-running tasks. " +
+			"NOT for trivial single-step work. Each item has an id, headline, status (pending/in_progress/completed), " +
+			"and optional detail (definitionOfDone, constraints, refs, deps, rationale, nextStep). " +
+			"Pass items to create or update. To replace the entire list, pass replaceAll: true.",
+		promptSnippet: "Manage persistent todo list for multi-step tasks",
+		promptGuidelines: [
+			"Use todo_write to create a plan before starting multi-step work. Fill definitionOfDone for every item.",
+			"Use todo_set_status to move items between pending, in_progress, and completed. Only one item may be in_progress at a time.",
+			"Use todo_get to fetch full detail of a specific item by ID when you need the agent-facing notes.",
+			"Use todo_list to see the compact list without detail.",
+			"Refine the active item's detail just before executing it — don't trust stale plan notes.",
+		],
+		parameters: Type.Object({
+			items: Type.Array(
+				Type.Object({
+					id: Type.String({
+						description: "Stable short unique ID (e.g. t1, t2)",
+					}),
+					headline: Type.String({
+						description: "Imperative user-facing headline",
+					}),
+					status: Type.Optional(
+						StringEnum(["pending", "in_progress", "completed"] as const),
+					),
+					detail: Type.Optional(
+						Type.Object({
+							definitionOfDone: Type.Optional(
+								Type.String({
+									description:
+										"Acceptance criteria — how you'll know it's done",
+								}),
+							),
+							constraints: Type.Optional(
+								Type.Array(Type.String({ description: "Guardrails" })),
+							),
+							refs: Type.Optional(
+								Type.Array(
+									Type.String({
+										description:
+											"Pointers: file paths, symbols, IDs — not copies",
+									}),
+								),
+							),
+							deps: Type.Optional(
+								Type.Array(
+									Type.String({ description: "IDs this item depends on" }),
+								),
+							),
+							rationale: Type.Optional(
+								Type.String({ description: "Why this item exists" }),
+							),
+							nextStep: Type.Optional(
+								Type.String({
+									description: "One-line hand-off note: what to do next",
+								}),
+							),
+						}),
+					),
+				}),
+			),
+			replaceAll: Type.Optional(
+				Type.Boolean({
+					description: "Replace entire list (default: false, upsert)",
+				}),
+			),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (params.replaceAll) {
+				todoList = { items: [] };
+			}
+
+			for (const newItem of params.items) {
+				const existing = todoList.items.find((i) => i.id === newItem.id);
+				if (existing) {
+					if (newItem.headline) existing.headline = newItem.headline;
+					if (newItem.status) existing.status = newItem.status;
+					if (newItem.detail) {
+						existing.detail = { ...existing.detail, ...newItem.detail };
+					}
+				} else {
+					todoList.items.push({
+						id: newItem.id,
+						headline: newItem.headline,
+						status: newItem.status ?? "pending",
+						detail: newItem.detail ?? {},
+					});
+				}
+			}
+
+			enforceSingleInProgress();
+			saveState();
+			refreshOverlay(ctx);
+
+			const summary = todoList.items
+				.map((i) => {
+					const icon =
+						i.status === "completed"
+							? "✅"
+							: i.status === "in_progress"
+								? "▶️"
+								: "⬜";
+					return `${icon} ${i.id}: ${i.headline}`;
+				})
+				.join("\n");
+
+			return {
+				content: [{ type: "text", text: `Todo list updated:\n${summary}` }],
+				details: { items: todoList.items.length },
+			};
+		},
+	});
+
+	// todo_set_status: move an item's status
+	pi.registerTool({
+		name: "todo_set_status",
+		label: "Todo Set Status",
+		description:
+			"Change a todo item's status. Exactly one item may be in_progress at a time — " +
+			"setting a new in_progress automatically moves the previous one to pending. " +
+			"When all items are completed, the list is retired with a durable record.",
+		parameters: Type.Object({
+			id: Type.String({ description: "Todo item ID" }),
+			status: StringEnum(["pending", "in_progress", "completed"] as const),
+			nextStep: Type.Optional(
+				Type.String({ description: "Update the nextStep hand-off note" }),
+			),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const item = todoList.items.find((i) => i.id === params.id);
+			if (!item) {
+				return {
+					content: [{ type: "text", text: `Todo item ${params.id} not found` }],
+					details: { error: "not found" },
+				};
+			}
+
+			// Check deps before setting in_progress
+			if (params.status === "in_progress") {
+				const unmetDeps = checkDeps(item);
+				if (unmetDeps.length > 0) {
+					if (config.strictDeps) {
+						return {
+							content: [
+								{
+									type: "text",
+									text:
+										`Blocked: ${params.id} has unmet dependencies: ${unmetDeps.join(", ")}. ` +
+										`Complete those first, or set strictDeps: false in config.`,
+								},
+							],
+							details: { error: "unmet deps", unmetDeps },
+						};
+					} else {
+						return {
+							content: [
+								{
+									type: "text",
+									text:
+										`Warning: ${params.id} has unmet dependencies: ${unmetDeps.join(", ")}. ` +
+										`Proceeding (strictDeps is off). Status set to in_progress.`,
+								},
+							],
+							details: { warning: "unmet deps", unmetDeps },
+						};
+					}
+				}
+
+				// Move previous in_progress to pending
+				for (const i of todoList.items) {
+					if (i.id !== params.id && i.status === "in_progress") {
+						i.status = "pending";
+					}
+				}
+			}
+
+			item.status = params.status;
+			if (params.nextStep !== undefined && item.detail) {
+				item.detail.nextStep = params.nextStep;
+			}
+
+			saveState();
+			refreshOverlay(ctx);
+
+			// Check if all completed → retire
+			if (
+				todoList.items.length > 0 &&
+				todoList.items.every((i) => i.status === "completed")
+			) {
+				const summary = todoList.items
+					.map((i) => `- [x] ${i.id}: ${i.headline}`)
+					.join("\n");
+				retireTodoList(cwd);
+				todoList = { items: [] };
+				ctx.ui.setStatus("pi-todo", undefined);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `All todos completed! Retired to ${DONE_FILE}.\n\n${summary}`,
+						},
+					],
+					details: { retired: true },
+				};
+			}
+
+			// Update status indicator
+			const inProgress = todoList.items.find((i) => i.status === "in_progress");
+			if (inProgress) {
+				ctx.ui.setStatus(
+					"pi-todo",
+					`▶ ${inProgress.id}: ${inProgress.headline}`,
+				);
+			} else if (todoList.items.length > 0) {
+				ctx.ui.setStatus("pi-todo", `${todoList.items.length} todo(s)`);
+			}
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `${params.id}: ${item.headline} → ${params.status}`,
+					},
+				],
+				details: { id: params.id, status: params.status },
+			};
+		},
+	});
+
+	// todo_get: fetch full detail of a single item by ID
+	pi.registerTool({
+		name: "todo_get",
+		label: "Todo Get",
+		description:
+			"Fetch the full detail of a single todo item by ID. Use this to inspect agent-facing notes (definitionOfDone, constraints, refs, deps, rationale, nextStep) for a specific item.",
+		parameters: Type.Object({
+			id: Type.String({ description: "Todo item ID" }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const item = todoList.items.find((i) => i.id === params.id);
+			if (!item) {
+				return {
+					content: [{ type: "text", text: `Todo item ${params.id} not found` }],
+					details: { error: "not found" },
+				};
+			}
+
+			const lines: string[] = [
+				`## ${item.id}: ${item.headline}`,
+				`Status: ${item.status}`,
+			];
+
+			if (item.detail) {
+				const d = item.detail;
+				if (d.definitionOfDone)
+					lines.push(`definitionOfDone: ${d.definitionOfDone}`);
+				if (d.constraints?.length)
+					lines.push(`constraints: ${d.constraints.join("; ")}`);
+				if (d.refs?.length) lines.push(`refs: ${d.refs.join(", ")}`);
+				if (d.deps?.length) lines.push(`deps: ${d.deps.join(", ")}`);
+				if (d.rationale) lines.push(`rationale: ${d.rationale}`);
+				if (d.nextStep) lines.push(`nextStep: ${d.nextStep}`);
+			}
+
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { item },
+			};
+		},
+	});
+
+	// todo_list: compact list without full detail
+	pi.registerTool({
+		name: "todo_list",
+		label: "Todo List",
+		description:
+			"Show the compact todo list (id, headline, status) without full detail. Use for a quick overview.",
+		parameters: Type.Object({}),
+
+		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+			if (todoList.items.length === 0) {
+				return {
+					content: [{ type: "text", text: "No todos" }],
+					details: { items: [] },
+				};
+			}
+
+			const summary = todoList.items
+				.map((i) => {
+					const icon =
+						i.status === "completed"
+							? "✅"
+							: i.status === "in_progress"
+								? "▶️"
+								: "⬜";
+					return `${icon} ${i.id}: ${i.headline}`;
+				})
+				.join("\n");
+
+			return {
+				content: [{ type: "text", text: summary }],
+				details: {
+					items: todoList.items.map((i) => ({
+						id: i.id,
+						headline: i.headline,
+						status: i.status,
+					})),
+				},
+			};
+		},
+	});
+
+	// ─── /todo command (user inspection) ────────────────────────────────────
+
+	pi.registerCommand("todo", {
+		description: "View and manage todo items",
+		getArgumentCompletions: (prefix: string) => {
+			const actions = ["list", "detail", "clear"];
+			const items = actions.map((a) => ({ value: a, label: a }));
+			const filtered = items.filter((i) => i.value.startsWith(prefix));
+			return filtered.length > 0 ? filtered : null;
+		},
+		handler: async (args, ctx) => {
+			if (!ctx.hasUI) {
+				if (todoList.items.length === 0) {
+					ctx.ui.notify("No todos", "info");
+					return;
+				}
+				const text = todoList.items
+					.map((i) => {
+						const icon =
+							i.status === "completed"
+								? "✅"
+								: i.status === "in_progress"
+									? "▶️"
+									: "⬜";
+						return `${icon} ${i.id}: ${i.headline}`;
+					})
+					.join("\n");
+				ctx.ui.setEditorText(text);
+				return;
+			}
+
+			if (args === "clear") {
+				const ok = await ctx.ui.confirm("Clear todos", "Clear all todos?");
+				if (ok) {
+					todoList = { items: [] };
+					saveState();
+					refreshOverlay(ctx);
+					ctx.ui.setStatus("pi-todo", undefined);
+					ctx.ui.notify("Todos cleared", "info");
+				}
+				return;
+			}
+
+			if (args === "detail" || args === "list") {
+				await showTodoDetail(ctx, args === "detail");
+				return;
+			}
+
+			// Default: show list view
+			await showTodoList(ctx);
+		},
+	});
+
+	// ─── UI Components ──────────────────────────────────────────────────────
+
+	async function showTodoList(ctx: ExtensionContext) {
+		if (todoList.items.length === 0) {
+			ctx.ui.notify("No todos. Ask the agent to create some.", "info");
+			return;
+		}
+
+		await ctx.ui.custom<void>((_tui, theme, _kb, close) => {
+			const container = new Container();
+
+			container.addChild(
+				new DynamicBorder((s: string) => theme.fg("accent", s)),
+			);
+
+			const doneCount = todoList.items.filter(
+				(i) => i.status === "completed",
+			).length;
+			const total = todoList.items.length;
+			container.addChild(
+				new Text(
+					theme.fg("accent", theme.bold(` Todos (${doneCount}/${total})`)),
+					1,
+					0,
+				),
+			);
+
+			container.addChild(new Spacer(1));
+
+			for (const item of todoList.items) {
+				const icon =
+					item.status === "completed"
+						? theme.fg("success", "✅")
+						: item.status === "in_progress"
+							? theme.fg("accent", "▶️")
+							: theme.fg("dim", "⬜");
+				const id = theme.fg("accent", item.id);
+				const text =
+					item.status === "completed"
+						? theme.fg("dim", item.headline)
+						: theme.fg("text", item.headline);
+				container.addChild(new Text(`${icon} ${id} ${text}`, 2, 0));
+			}
+
+			container.addChild(new Spacer(1));
+			container.addChild(
+				new Text(
+					theme.fg("dim", "Press Escape to close • /todo detail for full view"),
+					1,
+					0,
+				),
+			);
+			container.addChild(
+				new DynamicBorder((s: string) => theme.fg("accent", s)),
+			);
+
+			return {
+				render: (w) => container.render(w),
+				invalidate: () => container.invalidate(),
+				handleInput: (data) => {
+					if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+						close();
+					}
+				},
+			};
+		});
+	}
+
+	async function showTodoDetail(ctx: ExtensionContext, _showAll: boolean) {
+		if (todoList.items.length === 0) {
+			ctx.ui.notify("No todos", "info");
+			return;
+		}
+
+		const items: SelectItem[] = todoList.items.map((item) => {
+			const icon =
+				item.status === "completed"
+					? "✅"
+					: item.status === "in_progress"
+						? "▶️"
+						: "⬜";
+			return {
+				value: item.id,
+				label: `${icon} ${item.id}: ${item.headline}`,
+				description: item.status,
+			};
+		});
+
+		const selectedId = await ctx.ui.custom<string | null>(
+			(tui, theme, _kb, done) => {
+				const container = new Container();
+
+				container.addChild(
+					new DynamicBorder((s: string) => theme.fg("accent", s)),
+				);
+				container.addChild(
+					new Text(theme.fg("accent", theme.bold(" Select Todo Item")), 1, 0),
+				);
+				container.addChild(new Spacer(1));
+
+				const selectList = new SelectList(items, Math.min(items.length, 10), {
+					selectedPrefix: (t) => theme.fg("accent", t),
+					selectedText: (t) => theme.fg("accent", t),
+					description: (t) => theme.fg("muted", t),
+					scrollInfo: (t) => theme.fg("dim", t),
+					noMatch: (t) => theme.fg("warning", t),
+				});
+				selectList.onSelect = (item) => done(item.value);
+				selectList.onCancel = () => done(null);
+				container.addChild(selectList);
+
+				container.addChild(
+					new Text(
+						theme.fg("dim", "↑↓ navigate • enter select • esc cancel"),
+						1,
+						0,
+					),
+				);
+				container.addChild(
+					new DynamicBorder((s: string) => theme.fg("accent", s)),
+				);
+
+				return {
+					render: (w) => container.render(w),
+					invalidate: () => container.invalidate(),
+					handleInput: (data) => {
+						selectList.handleInput(data);
+						tui.requestRender();
+					},
+				};
+			},
+		);
+
+		if (!selectedId) return;
+
+		const item = todoList.items.find((i) => i.id === selectedId);
+		if (!item) return;
+
+		await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
+			const container = new Container();
+
+			container.addChild(
+				new DynamicBorder((s: string) => theme.fg("accent", s)),
+			);
+			container.addChild(
+				new Text(
+					theme.fg("accent", theme.bold(` ${item.id}: ${item.headline}`)),
+					1,
+					0,
+				),
+			);
+			container.addChild(
+				new Text(theme.fg("muted", `Status: ${item.status}`), 2, 0),
+			);
+			container.addChild(new Spacer(1));
+
+			if (item.detail) {
+				const d = item.detail;
+				if (d.definitionOfDone) {
+					container.addChild(
+						new Text(
+							theme.fg("text", `definitionOfDone: ${d.definitionOfDone}`),
+							2,
+							0,
+						),
+					);
+				}
+				if (d.constraints?.length) {
+					for (const c of d.constraints) {
+						container.addChild(
+							new Text(theme.fg("warning", `constraints: ${c}`), 2, 0),
+						);
+					}
+				}
+				if (d.refs?.length) {
+					for (const r of d.refs) {
+						container.addChild(
+							new Text(theme.fg("mdLink", `refs: ${r}`), 2, 0),
+						);
+					}
+				}
+				if (d.deps?.length) {
+					for (const dep of d.deps) {
+						container.addChild(
+							new Text(theme.fg("accent", `deps: ${dep}`), 2, 0),
+						);
+					}
+				}
+				if (d.rationale) {
+					container.addChild(
+						new Text(theme.fg("dim", `rationale: ${d.rationale}`), 2, 0),
+					);
+				}
+				if (d.nextStep) {
+					container.addChild(
+						new Text(theme.fg("success", `nextStep: ${d.nextStep}`), 2, 0),
+					);
+				}
+			} else {
+				container.addChild(new Text(theme.fg("dim", "No detail"), 2, 0));
+			}
+
+			container.addChild(new Spacer(1));
+			container.addChild(
+				new Text(theme.fg("dim", "Press Escape to close"), 1, 0),
+			);
+			container.addChild(
+				new DynamicBorder((s: string) => theme.fg("accent", s)),
+			);
+
+			return {
+				render: (w) => container.render(w),
+				invalidate: () => container.invalidate(),
+				handleInput: (data) => {
+					if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+						done();
+					}
+				},
+			};
+		});
+	}
+}
