@@ -488,341 +488,343 @@ export default function (pi: ExtensionAPI) {
 		overlayComponent = null;
 	});
 
-	// ─── Per-turn recitation ────────────────────────────────────────────────
+	// ─── Per-prompt recitation (once per user prompt, before their message) ──
+
+	let injectRecitation = false;
+
+	pi.on("agent_start", async (_event, _ctx) => {
+		injectRecitation = todoList.items.length > 0;
+	});
 
 	pi.on("context", async (event, _ctx) => {
-		if (todoList.items.length === 0) return;
+		if (!injectRecitation) return;
+		injectRecitation = false;
 
 		const recitation = buildRecitation(todoList, config);
 		if (!recitation) return;
 
+		// Find the last user message and insert recitation before it
 		const messages = [...event.messages];
-		messages.push({
-			role: "user",
-			content: [{ type: "text", text: recitation }],
+		let insertIndex = messages.length;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].role === "user") {
+				insertIndex = i;
+				break;
+			}
+		}
+
+		messages.splice(insertIndex, 0, {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: recitation }],
 			timestamp: Date.now(),
 		} as any);
 
 		return { messages };
 	});
 
+	// ─── Helpers ────────────────────────────────────────────────────────────
+
+	const buildSummary = () =>
+		todoList.items
+			.map((i) => {
+				const icon =
+					i.status === "completed"
+						? "✅"
+						: i.status === "in_progress"
+							? "▶️"
+							: "⬜";
+				return `${icon} ${i.id}: ${i.headline}`;
+			})
+			.join("\n");
+
+	const updateStatusIndicator = (ctx: ExtensionContext) => {
+		const inProgress = todoList.items.find((i) => i.status === "in_progress");
+		if (inProgress) {
+			ctx.ui.setStatus("pi-todo", `▶ ${inProgress.id}: ${inProgress.headline}`);
+		} else if (todoList.items.length > 0) {
+			ctx.ui.setStatus("pi-todo", `${todoList.items.length} todo(s)`);
+		}
+	};
+
+	const handleRetire = (ctx: ExtensionContext) => {
+		if (
+			todoList.items.length > 0 &&
+			todoList.items.every((i) => i.status === "completed")
+		) {
+			const summary = todoList.items
+				.map((i) => `- [x] ${i.id}: ${i.headline}`)
+				.join("\n");
+			retireTodoList(cwd);
+			todoList = { items: [] };
+			ctx.ui.setStatus("pi-todo", undefined);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `All todos completed! Retired to ${DONE_FILE}.\n\n${summary}`,
+					},
+				],
+				details: { retired: true },
+			};
+		}
+		return null;
+	};
+
 	// ─── Tools ──────────────────────────────────────────────────────────────
 
-	// todo_write: create/replace list or upsert items
 	pi.registerTool({
-		name: "todo_write",
-		label: "Todo Write",
+		name: "todo",
+		label: "Todo",
 		description:
-			"Create or update todo items. Use for multi-step, multi-tool, or long-running tasks. " +
-			"NOT for trivial single-step work. Each item has an id, headline, status (pending/in_progress/completed), " +
-			"and optional detail (definitionOfDone, constraints, refs, deps, rationale, nextStep). " +
-			"Pass items to create or update. To replace the entire list, pass replaceAll: true.",
+			"Manage the todo list. Use for multi-step, multi-tool, or long-running tasks. " +
+			"NOT for trivial single-step work. Actions: write (create/update items), " +
+			"set_status (change status), get (fetch item detail), list (compact overview).",
 		promptSnippet: "Manage persistent todo list for multi-step tasks",
 		promptGuidelines: [
-			"Use todo_write to create a plan before starting multi-step work. Fill definitionOfDone for every item.",
-			"Use todo_set_status to move items between pending, in_progress, and completed. Only one item may be in_progress at a time.",
-			"Use todo_get to fetch full detail of a specific item by ID when you need the agent-facing notes.",
-			"Use todo_list to see the compact list without detail.",
+			"Use todo with action 'write' to create a plan before starting multi-step work. Fill definitionOfDone for every item.",
+			"Use todo with action 'set_status' to move items between pending, in_progress, and completed. Only one item may be in_progress at a time.",
+			"Use todo with action 'get' to fetch full detail of a specific item by ID when you need the agent-facing notes.",
+			"Use todo with action 'list' to see the compact list without detail.",
 			"Refine the active item's detail just before executing it — don't trust stale plan notes.",
 		],
 		parameters: Type.Object({
-			items: Type.Array(
-				Type.Object({
-					id: Type.String({
-						description: "Stable short unique ID (e.g. t1, t2)",
-					}),
-					headline: Type.String({
-						description: "Imperative user-facing headline",
-					}),
-					status: Type.Optional(
-						StringEnum(["pending", "in_progress", "completed"] as const),
-					),
-					detail: Type.Optional(
-						Type.Object({
-							definitionOfDone: Type.Optional(
-								Type.String({
-									description:
-										"Acceptance criteria — how you'll know it's done",
-								}),
-							),
-							constraints: Type.Optional(
-								Type.Array(Type.String({ description: "Guardrails" })),
-							),
-							refs: Type.Optional(
-								Type.Array(
+			action: StringEnum(["write", "set_status", "get", "list"] as const),
+			// write
+			items: Type.Optional(
+				Type.Array(
+					Type.Object({
+						id: Type.String({
+							description: "Stable short unique ID (e.g. t1, t2)",
+						}),
+						headline: Type.String({
+							description: "Imperative user-facing headline",
+						}),
+						status: Type.Optional(
+							StringEnum(["pending", "in_progress", "completed"] as const),
+						),
+						detail: Type.Optional(
+							Type.Object({
+								definitionOfDone: Type.Optional(
 									Type.String({
 										description:
-											"Pointers: file paths, symbols, IDs — not copies",
+											"Acceptance criteria — how you'll know it's done",
 									}),
 								),
-							),
-							deps: Type.Optional(
-								Type.Array(
-									Type.String({ description: "IDs this item depends on" }),
+								constraints: Type.Optional(
+									Type.Array(Type.String({ description: "Guardrails" })),
 								),
-							),
-							rationale: Type.Optional(
-								Type.String({ description: "Why this item exists" }),
-							),
-							nextStep: Type.Optional(
-								Type.String({
-									description: "One-line hand-off note: what to do next",
-								}),
-							),
-						}),
-					),
-				}),
+								refs: Type.Optional(
+									Type.Array(
+										Type.String({
+											description:
+												"Pointers: file paths, symbols, IDs — not copies",
+										}),
+									),
+								),
+								deps: Type.Optional(
+									Type.Array(
+										Type.String({ description: "IDs this item depends on" }),
+									),
+								),
+								rationale: Type.Optional(
+									Type.String({ description: "Why this item exists" }),
+								),
+								nextStep: Type.Optional(
+									Type.String({
+										description: "One-line hand-off note: what to do next",
+									}),
+								),
+							}),
+						),
+					}),
+				),
 			),
 			replaceAll: Type.Optional(
 				Type.Boolean({
 					description: "Replace entire list (default: false, upsert)",
 				}),
 			),
-		}),
-
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (params.replaceAll) {
-				todoList = { items: [] };
-			}
-
-			for (const newItem of params.items) {
-				const existing = todoList.items.find((i) => i.id === newItem.id);
-				if (existing) {
-					if (newItem.headline) existing.headline = newItem.headline;
-					if (newItem.status) existing.status = newItem.status;
-					if (newItem.detail) {
-						existing.detail = { ...existing.detail, ...newItem.detail };
-					}
-				} else {
-					todoList.items.push({
-						id: newItem.id,
-						headline: newItem.headline,
-						status: newItem.status ?? "pending",
-						detail: newItem.detail ?? {},
-					});
-				}
-			}
-
-			enforceSingleInProgress();
-			saveState();
-			refreshOverlay(ctx);
-
-			const summary = todoList.items
-				.map((i) => {
-					const icon =
-						i.status === "completed"
-							? "✅"
-							: i.status === "in_progress"
-								? "▶️"
-								: "⬜";
-					return `${icon} ${i.id}: ${i.headline}`;
-				})
-				.join("\n");
-
-			return {
-				content: [{ type: "text", text: `Todo list updated:\n${summary}` }],
-				details: { items: todoList.items.length },
-			};
-		},
-	});
-
-	// todo_set_status: move an item's status
-	pi.registerTool({
-		name: "todo_set_status",
-		label: "Todo Set Status",
-		description:
-			"Change a todo item's status. Exactly one item may be in_progress at a time — " +
-			"setting a new in_progress automatically moves the previous one to pending. " +
-			"When all items are completed, the list is retired with a durable record.",
-		parameters: Type.Object({
-			id: Type.String({ description: "Todo item ID" }),
-			status: StringEnum(["pending", "in_progress", "completed"] as const),
+			// set_status
+			id: Type.Optional(Type.String({ description: "Todo item ID" })),
+			status: Type.Optional(
+				StringEnum(["pending", "in_progress", "completed"] as const),
+			),
 			nextStep: Type.Optional(
 				Type.String({ description: "Update the nextStep hand-off note" }),
 			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const item = todoList.items.find((i) => i.id === params.id);
-			if (!item) {
-				return {
-					content: [{ type: "text", text: `Todo item ${params.id} not found` }],
-					details: { error: "not found" },
-				};
-			}
+			const { action } = params;
 
-			// Check deps before setting in_progress
-			if (params.status === "in_progress") {
-				const unmetDeps = checkDeps(item);
-				if (unmetDeps.length > 0) {
-					if (config.strictDeps) {
-						return {
-							content: [
-								{
-									type: "text",
-									text:
-										`Blocked: ${params.id} has unmet dependencies: ${unmetDeps.join(", ")}. ` +
-										`Complete those first, or set strictDeps: false in config.`,
-								},
-							],
-							details: { error: "unmet deps", unmetDeps },
-						};
+			// ── write ──
+			if (action === "write") {
+				if (params.replaceAll) {
+					todoList = { items: [] };
+				}
+
+				for (const newItem of params.items ?? []) {
+					const existing = todoList.items.find((i) => i.id === newItem.id);
+					if (existing) {
+						if (newItem.headline) existing.headline = newItem.headline;
+						if (newItem.status) existing.status = newItem.status;
+						if (newItem.detail) {
+							existing.detail = { ...existing.detail, ...newItem.detail };
+						}
 					} else {
-						return {
-							content: [
-								{
-									type: "text",
-									text:
-										`Warning: ${params.id} has unmet dependencies: ${unmetDeps.join(", ")}. ` +
-										`Proceeding (strictDeps is off). Status set to in_progress.`,
-								},
-							],
-							details: { warning: "unmet deps", unmetDeps },
-						};
+						todoList.items.push({
+							id: newItem.id,
+							headline: newItem.headline,
+							status: newItem.status ?? "pending",
+							detail: newItem.detail ?? {},
+						});
 					}
 				}
 
-				// Move previous in_progress to pending
-				for (const i of todoList.items) {
-					if (i.id !== params.id && i.status === "in_progress") {
-						i.status = "pending";
-					}
-				}
-			}
+				enforceSingleInProgress();
+				saveState();
+				refreshOverlay(ctx);
+				updateStatusIndicator(ctx);
 
-			item.status = params.status;
-			if (params.nextStep !== undefined && item.detail) {
-				item.detail.nextStep = params.nextStep;
-			}
-
-			saveState();
-			refreshOverlay(ctx);
-
-			// Check if all completed → retire
-			if (
-				todoList.items.length > 0 &&
-				todoList.items.every((i) => i.status === "completed")
-			) {
-				const summary = todoList.items
-					.map((i) => `- [x] ${i.id}: ${i.headline}`)
-					.join("\n");
-				retireTodoList(cwd);
-				todoList = { items: [] };
-				ctx.ui.setStatus("pi-todo", undefined);
 				return {
 					content: [
-						{
-							type: "text",
-							text: `All todos completed! Retired to ${DONE_FILE}.\n\n${summary}`,
-						},
+						{ type: "text", text: `Todo list updated:\n${buildSummary()}` },
 					],
-					details: { retired: true },
+					details: { items: todoList.items.length },
 				};
 			}
 
-			// Update status indicator
-			const inProgress = todoList.items.find((i) => i.status === "in_progress");
-			if (inProgress) {
-				ctx.ui.setStatus(
-					"pi-todo",
-					`▶ ${inProgress.id}: ${inProgress.headline}`,
-				);
-			} else if (todoList.items.length > 0) {
-				ctx.ui.setStatus("pi-todo", `${todoList.items.length} todo(s)`);
+			// ── set_status ──
+			if (action === "set_status") {
+				const id = params.id!;
+				const item = todoList.items.find((i) => i.id === id);
+				if (!item) {
+					return {
+						content: [{ type: "text", text: `Todo item ${id} not found` }],
+						details: { error: "not found" },
+					};
+				}
+
+				const newStatus = params.status!;
+
+				// Check deps before setting in_progress
+				if (newStatus === "in_progress") {
+					const unmetDeps = checkDeps(item);
+					if (unmetDeps.length > 0) {
+						if (config.strictDeps) {
+							return {
+								content: [
+									{
+										type: "text",
+										text:
+											`Blocked: ${id} has unmet dependencies: ${unmetDeps.join(", ")}. ` +
+											`Complete those first, or set strictDeps: false in config.`,
+									},
+								],
+								details: { error: "unmet deps", unmetDeps },
+							};
+						} else {
+							return {
+								content: [
+									{
+										type: "text",
+										text:
+											`Warning: ${id} has unmet dependencies: ${unmetDeps.join(", ")}. ` +
+											`Proceeding (strictDeps is off). Status set to in_progress.`,
+									},
+								],
+								details: { warning: "unmet deps", unmetDeps },
+							};
+						}
+					}
+
+					// Move previous in_progress to pending
+					for (const i of todoList.items) {
+						if (i.id !== id && i.status === "in_progress") {
+							i.status = "pending";
+						}
+					}
+				}
+
+				item.status = newStatus;
+				if (params.nextStep !== undefined && item.detail) {
+					item.detail.nextStep = params.nextStep;
+				}
+
+				saveState();
+				refreshOverlay(ctx);
+
+				const retired = handleRetire(ctx);
+				if (retired) return retired;
+
+				updateStatusIndicator(ctx);
+
+				return {
+					content: [
+						{ type: "text", text: `${id}: ${item.headline} → ${newStatus}` },
+					],
+					details: { id, status: newStatus },
+				};
 			}
 
-			return {
-				content: [
-					{
-						type: "text",
-						text: `${params.id}: ${item.headline} → ${params.status}`,
+			// ── get ──
+			if (action === "get") {
+				const id = params.id!;
+				const item = todoList.items.find((i) => i.id === id);
+				if (!item) {
+					return {
+						content: [{ type: "text", text: `Todo item ${id} not found` }],
+						details: { error: "not found" },
+					};
+				}
+
+				const lines: string[] = [
+					`## ${item.id}: ${item.headline}`,
+					`Status: ${item.status}`,
+				];
+
+				if (item.detail) {
+					const d = item.detail;
+					if (d.definitionOfDone)
+						lines.push(`definitionOfDone: ${d.definitionOfDone}`);
+					if (d.constraints?.length)
+						lines.push(`constraints: ${d.constraints.join("; ")}`);
+					if (d.refs?.length) lines.push(`refs: ${d.refs.join(", ")}`);
+					if (d.deps?.length) lines.push(`deps: ${d.deps.join(", ")}`);
+					if (d.rationale) lines.push(`rationale: ${d.rationale}`);
+					if (d.nextStep) lines.push(`nextStep: ${d.nextStep}`);
+				}
+
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: { item },
+				};
+			}
+
+			// ── list ──
+			if (action === "list") {
+				if (todoList.items.length === 0) {
+					return {
+						content: [{ type: "text", text: "No todos" }],
+						details: { items: [] },
+					};
+				}
+
+				return {
+					content: [{ type: "text", text: buildSummary() }],
+					details: {
+						items: todoList.items.map((i) => ({
+							id: i.id,
+							headline: i.headline,
+							status: i.status,
+						})),
 					},
-				],
-				details: { id: params.id, status: params.status },
-			};
-		},
-	});
-
-	// todo_get: fetch full detail of a single item by ID
-	pi.registerTool({
-		name: "todo_get",
-		label: "Todo Get",
-		description:
-			"Fetch the full detail of a single todo item by ID. Use this to inspect agent-facing notes (definitionOfDone, constraints, refs, deps, rationale, nextStep) for a specific item.",
-		parameters: Type.Object({
-			id: Type.String({ description: "Todo item ID" }),
-		}),
-
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const item = todoList.items.find((i) => i.id === params.id);
-			if (!item) {
-				return {
-					content: [{ type: "text", text: `Todo item ${params.id} not found` }],
-					details: { error: "not found" },
 				};
 			}
 
-			const lines: string[] = [
-				`## ${item.id}: ${item.headline}`,
-				`Status: ${item.status}`,
-			];
-
-			if (item.detail) {
-				const d = item.detail;
-				if (d.definitionOfDone)
-					lines.push(`definitionOfDone: ${d.definitionOfDone}`);
-				if (d.constraints?.length)
-					lines.push(`constraints: ${d.constraints.join("; ")}`);
-				if (d.refs?.length) lines.push(`refs: ${d.refs.join(", ")}`);
-				if (d.deps?.length) lines.push(`deps: ${d.deps.join(", ")}`);
-				if (d.rationale) lines.push(`rationale: ${d.rationale}`);
-				if (d.nextStep) lines.push(`nextStep: ${d.nextStep}`);
-			}
-
 			return {
-				content: [{ type: "text", text: lines.join("\n") }],
-				details: { item },
-			};
-		},
-	});
-
-	// todo_list: compact list without full detail
-	pi.registerTool({
-		name: "todo_list",
-		label: "Todo List",
-		description:
-			"Show the compact todo list (id, headline, status) without full detail. Use for a quick overview.",
-		parameters: Type.Object({}),
-
-		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
-			if (todoList.items.length === 0) {
-				return {
-					content: [{ type: "text", text: "No todos" }],
-					details: { items: [] },
-				};
-			}
-
-			const summary = todoList.items
-				.map((i) => {
-					const icon =
-						i.status === "completed"
-							? "✅"
-							: i.status === "in_progress"
-								? "▶️"
-								: "⬜";
-					return `${icon} ${i.id}: ${i.headline}`;
-				})
-				.join("\n");
-
-			return {
-				content: [{ type: "text", text: summary }],
-				details: {
-					items: todoList.items.map((i) => ({
-						id: i.id,
-						headline: i.headline,
-						status: i.status,
-					})),
-				},
+				content: [{ type: "text", text: `Unknown action: ${action}` }],
+				details: { error: "unknown action" },
 			};
 		},
 	});
