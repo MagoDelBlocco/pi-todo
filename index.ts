@@ -472,9 +472,15 @@ export default function (pi: ExtensionAPI) {
 		// Status indicator
 		const inProgress = todoList.items.find((i) => i.status === "in_progress");
 		if (inProgress) {
-			ctx.ui.setStatus("pi-todo", `▶ ${inProgress.id}: ${inProgress.headline}`);
+			ctx.ui.setStatus(
+				"pi-todo",
+				`│ ${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("accent", `▶ ${inProgress.id}: ${inProgress.headline}`))}`,
+			);
 		} else if (todoList.items.length > 0) {
-			ctx.ui.setStatus("pi-todo", `${todoList.items.length} todo(s)`);
+			ctx.ui.setStatus(
+				"pi-todo",
+				`│ ${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("dim", `${todoList.items.length} todo(s)`))}`,
+			);
 		}
 	});
 
@@ -540,9 +546,15 @@ export default function (pi: ExtensionAPI) {
 	const updateStatusIndicator = (ctx: ExtensionContext) => {
 		const inProgress = todoList.items.find((i) => i.status === "in_progress");
 		if (inProgress) {
-			ctx.ui.setStatus("pi-todo", `▶ ${inProgress.id}: ${inProgress.headline}`);
+			ctx.ui.setStatus(
+				"pi-todo",
+				`│ ${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("accent", `▶ ${inProgress.id}: ${inProgress.headline}`))}`,
+			);
 		} else if (todoList.items.length > 0) {
-			ctx.ui.setStatus("pi-todo", `${todoList.items.length} todo(s)`);
+			ctx.ui.setStatus(
+				"pi-todo",
+				`│ ${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("dim", `${todoList.items.length} todo(s)`))}`,
+			);
 		}
 	};
 
