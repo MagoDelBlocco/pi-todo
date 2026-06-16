@@ -11,14 +11,16 @@ pi-todo gives the agent a reliable planning surface with two views:
 
 It also shows a persistent top-right overlay panel in the TUI that auto-hides when there are no todos.
 
-## Tools
+## Tool
 
-| Tool | Description |
-|------|-------------|
-| `todo_write` | Create or update todo items. Pass `replaceAll: true` to replace the entire list |
-| `todo_set_status` | Change an item's status (`pending` → `in_progress` → `completed`). Enforces single `in_progress` invariant |
-| `todo_get` | Fetch full detail of a single item by ID |
-| `todo_list` | Show compact list without detail |
+A single `todo` tool exposes four actions via the `action` parameter:
+
+| Action | Description |
+|--------|-------------|
+| `write` | Create or update todo items. Pass `replaceAll: true` to replace the entire list |
+| `set_status` | Change an item's status (`pending` → `in_progress` → `completed`). Enforces single `in_progress` invariant |
+| `get` | Fetch full detail of a single item by ID |
+| `list` | Show compact list without detail |
 
 ### Item Schema
 

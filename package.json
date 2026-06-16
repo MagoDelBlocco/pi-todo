@@ -2,6 +2,10 @@
   "name": "pi-todo",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/todo.test.js"
+  },
   "dependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",

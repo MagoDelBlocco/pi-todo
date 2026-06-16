@@ -13,7 +13,7 @@
 
 ```ts
 {
-  name: string;           // snake_case, e.g. "todo_write"
+  name: string;           // snake_case, e.g. "todo"
   label: string;          // Display name
   description: string;    // When to use this tool
   promptSnippet?: string; // One-line entry in "Available tools"
@@ -73,4 +73,3 @@ For injecting into `context` event: use `UserMessage` shape:
 - **No built-in to-do tool** — confirmed by reading README ("No built-in to-dos. They confuse models."). Building fresh.
 - **Recitation via `context` event** — appends a transient `UserMessage` to the message array each turn. Not persisted to session.
 - **File-based persistence** — `.pi/pi-todo.md` is the source of truth, loaded on `session_start`. In-memory state is reconstructed from the file, not from session entries.
-- **`before_agent_start` for reconcile** — inject reconcile info as a persistent `CustomMessage` on first turn after session start.

@@ -1,2 +1,4 @@
 node_modules/
 .pi-lens/
+# Runtime todo state written by the extension itself.
+.pi/
