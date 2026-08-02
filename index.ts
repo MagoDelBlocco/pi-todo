@@ -316,12 +316,12 @@ export default function (pi: ExtensionAPI) {
 		if (inProgress) {
 			ctx.ui.setStatus(
 				"pi-todo",
-				`│ ${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("accent", `▶ ${inProgress.id}: ${inProgress.headline}`))}`,
+				`${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("accent", `▶ ${inProgress.id}: ${inProgress.headline}`))}`,
 			);
 		} else if (todoList.items.length > 0) {
 			ctx.ui.setStatus(
 				"pi-todo",
-				`│ ${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("dim", `${todoList.items.length} todo(s)`))}`,
+				`${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("dim", `${todoList.items.length} todo(s)`))}`,
 			);
 		}
 	};
