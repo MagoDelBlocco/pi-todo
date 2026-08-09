@@ -75,9 +75,18 @@ function loadTodoList(cwd: string): TodoList {
 }
 
 function saveTodoList(cwd: string, list: TodoList): void {
+	const path = getTodoPath(cwd);
+
+	// An empty list means "no todos". Remove the file instead of writing an
+	// empty stub — otherwise the shutdown save resurrects the file that retire
+	// (or /todo clear) just deleted.
+	if (list.items.length === 0) {
+		if (existsSync(path)) unlinkSync(path);
+		return;
+	}
+
 	const piDir = getPiDir(cwd);
 	if (!existsSync(piDir)) mkdirSync(piDir, { recursive: true });
-	const path = getTodoPath(cwd);
 	writeFileSync(path, serializeTodoList(list), "utf-8");
 }
 
@@ -323,6 +332,8 @@ export default function (pi: ExtensionAPI) {
 				"pi-todo",
 				`${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("dim", `${todoList.items.length} todo(s)`))}`,
 			);
+		} else {
+			ctx.ui.setStatus("pi-todo", undefined);
 		}
 	};
 
@@ -465,6 +476,11 @@ export default function (pi: ExtensionAPI) {
 				enforceSingleInProgress(todoList);
 				saveState();
 				refreshOverlay(ctx);
+
+				// A write can complete the final item just as set_status can.
+				const retiredAfterWrite = handleRetire(ctx);
+				if (retiredAfterWrite) return retiredAfterWrite;
+
 				updateStatusIndicator(ctx);
 
 				return {
