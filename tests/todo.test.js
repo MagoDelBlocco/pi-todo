@@ -292,7 +292,12 @@ describe("extension integration", () => {
 			assert.equal(previous.details.item.status, "pending");
 			assert.equal(active.details.item.status, "in_progress");
 
-			for (const line of overlay.render(30)) assert.equal(visibleWidth(line), 30);
+			for (const width of [30, 61]) {
+				const lines = overlay.render(width);
+				assert.match(lines[0], /^╭─ TODO ─+╮$/);
+				assert.match(lines.at(-1), /^╰─+╯$/);
+				for (const line of lines) assert.equal(visibleWidth(line), width);
+			}
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}

@@ -34,6 +34,7 @@ import {
 	SelectList,
 	type Component,
 	truncateToWidth,
+	visibleWidth,
 	type OverlayHandle,
 	type TUI,
 } from "@earendil-works/pi-tui";
@@ -143,12 +144,12 @@ class TodoOverlay implements Component {
 		const lines: string[] = [];
 
 		// Top border with title
+		const topLeft = th.fg("borderMuted", "╭─");
 		const title = th.fg("accent", " TODO ");
-		const remaining = Math.max(0, width - 9);
+		const topRight = th.fg("borderMuted", "╮");
+		const remaining = Math.max(0, width - visibleWidth(topLeft + title + topRight));
 		lines.push(
-			th.fg("borderMuted", "╭─") +
-				title +
-				th.fg("borderMuted", "─".repeat(remaining) + "╮"),
+			topLeft + title + th.fg("borderMuted", "─".repeat(remaining)) + topRight,
 		);
 
 		const done = this.items.filter((i) => i.status === "completed").length;
