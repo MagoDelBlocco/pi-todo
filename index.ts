@@ -144,8 +144,7 @@ class TodoOverlay implements Component {
 
 		// Top border with title
 		const title = th.fg("accent", " TODO ");
-		const inner = Math.max(0, width - 2);
-		const remaining = Math.max(0, inner - 6);
+		const remaining = Math.max(0, width - 9);
 		lines.push(
 			th.fg("borderMuted", "╭─") +
 				title +
@@ -156,7 +155,7 @@ class TodoOverlay implements Component {
 		const total = this.items.length;
 		lines.push(
 			th.fg("borderMuted", "│ ") +
-				th.fg("dim", `${done}/${total}`) +
+				th.fg("dim", truncateToWidth(`${done}/${total}`, width - 4, "", true)) +
 				th.fg("borderMuted", " │"),
 		);
 
@@ -173,7 +172,7 @@ class TodoOverlay implements Component {
 					? th.fg("dim", item.headline)
 					: th.fg("text", item.headline);
 			const line = `${icon} ${id} ${text}`;
-			const padded = truncateToWidth(line, Math.max(4, width - 4), "", true);
+			const padded = truncateToWidth(line, width - 4, "", true);
 			lines.push(
 				th.fg("borderMuted", "│ ") + padded + th.fg("borderMuted", " │"),
 			);
@@ -271,18 +270,9 @@ export default function (pi: ExtensionAPI) {
 		overlayComponent = null;
 	});
 
-	// ─── Per-prompt recitation (once per user prompt, before their message) ──
-
-	let injectRecitation = false;
-
-	pi.on("agent_start", async (_event, _ctx) => {
-		injectRecitation = todoList.items.length > 0;
-	});
+	// ─── Recitation before every model call ─────────────────────────────────
 
 	pi.on("context", async (event, _ctx) => {
-		if (!injectRecitation) return;
-		injectRecitation = false;
-
 		const recitation = buildRecitation(todoList, config);
 		if (!recitation) return;
 
@@ -448,14 +438,31 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { action } = params;
+			const invalidParams = (message: string) => ({
+				content: [{ type: "text" as const, text: message }],
+				details: { error: "invalid parameters" },
+			});
 
 			// ── write ──
 			if (action === "write") {
+				if (!params.items) return invalidParams("write requires items");
+				for (const item of params.items) {
+					if (!/^\S+$/.test(item.id)) {
+						return invalidParams(`Invalid todo ID: ${item.id}`);
+					}
+				}
 				if (params.replaceAll) {
 					todoList = { items: [] };
 				}
 
 				for (const newItem of params.items ?? []) {
+					if (newItem.status === "in_progress") {
+						for (const item of todoList.items) {
+							if (item.id !== newItem.id && item.status === "in_progress") {
+								item.status = "pending";
+							}
+						}
+					}
 					const existing = todoList.items.find((i) => i.id === newItem.id);
 					if (existing) {
 						if (newItem.headline) existing.headline = newItem.headline;
@@ -493,7 +500,14 @@ export default function (pi: ExtensionAPI) {
 
 			// ── set_status ──
 			if (action === "set_status") {
-				const id = params.id!;
+				if (
+					!params.id ||
+					!params.status ||
+					!["pending", "in_progress", "completed"].includes(params.status)
+				) {
+					return invalidParams("set_status requires id and status");
+				}
+				const id = params.id;
 				const item = todoList.items.find((i) => i.id === id);
 				if (!item) {
 					return {
@@ -502,7 +516,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				const newStatus = params.status!;
+				const newStatus = params.status;
 				let warningNote = "";
 				let unmetDeps: string[] = [];
 
@@ -568,7 +582,8 @@ export default function (pi: ExtensionAPI) {
 
 			// ── get ──
 			if (action === "get") {
-				const id = params.id!;
+				if (!params.id) return invalidParams("get requires id");
+				const id = params.id;
 				const item = todoList.items.find((i) => i.id === id);
 				if (!item) {
 					return {

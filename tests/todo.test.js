@@ -6,6 +6,11 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import extension from "../index.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	parseTodoList,
 	serializeTodoList,
@@ -175,6 +180,20 @@ describe("parseTodoList", () => {
 // ─── Round-trip ───────────────────────────────────────────────────────────────
 
 describe("round-trip (serialize → parse)", () => {
+	it("preserves multiline values without creating items or fields", () => {
+		const original = list(item("t1", "First\n- [x] t2: Injected", "pending", {
+			nextStep: "Continue\n  - deps: t2",
+			refs: ["C:\\new\\path"],
+		}));
+		const parsed = parseTodoList(serializeTodoList(original));
+		assert.deepEqual(parsed, original);
+	});
+
+	it("preserves values beginning with the encoding marker", () => {
+		const original = list(item("t1", "@pi-todo-json:literal", "pending"));
+		assert.deepEqual(parseTodoList(serializeTodoList(original)), original);
+	});
+
 	it("preserves all fields for a single item", () => {
 		const original = list(
 			item("t1", "Test item", "in_progress", {
@@ -217,6 +236,66 @@ describe("round-trip (serialize → parse)", () => {
 	it("preserves empty list", () => {
 		const parsed = parseTodoList(serializeTodoList(list()));
 		assert.equal(parsed.items.length, 0);
+	});
+});
+
+describe("extension integration", () => {
+	it("recites on every context call, validates inputs, and switches the active item", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-todo-test-"));
+		try {
+			const handlers = new Map();
+			let todoTool;
+			let overlay;
+			const pi = {
+				on(name, handler) { handlers.set(name, handler); },
+				registerTool(tool) { todoTool = tool; },
+				registerCommand() {},
+			};
+			extension(pi);
+			const theme = { fg: (_color, text) => text };
+			const ctx = {
+				cwd,
+				hasUI: true,
+				ui: {
+					theme: { ...theme, bg: (_color, text) => text },
+					custom(factory, options) {
+						overlay = factory({ requestRender() {} }, theme, null, () => {});
+						options?.onHandle?.({ hide() {} });
+					},
+					setStatus() {},
+				},
+			};
+			await handlers.get("session_start")({}, ctx);
+			await todoTool.execute("call", { action: "write", items: [{ id: "t1", headline: "Do work" }] }, null, null, ctx);
+
+			const event = { messages: [{ role: "user", content: [{ type: "text", text: "Do it" }], timestamp: 1 }] };
+			for (let call = 0; call < 2; call++) {
+				const result = await handlers.get("context")(event, ctx);
+				assert.match(result.messages[0].content[0].text, /t1: Do work/);
+			}
+
+			const invalid = await todoTool.execute("call", { action: "set_status", id: "t1" }, null, null, ctx);
+			assert.equal(invalid.details.error, "invalid parameters");
+			const invalidStatus = await todoTool.execute("call", { action: "set_status", id: "t1", status: "bogus" }, null, null, ctx);
+			assert.equal(invalidStatus.details.error, "invalid parameters");
+			const missingGetId = await todoTool.execute("call", { action: "get" }, null, null, ctx);
+			assert.equal(missingGetId.details.error, "invalid parameters");
+			const missingWriteItems = await todoTool.execute("call", { action: "write", replaceAll: true }, null, null, ctx);
+			assert.equal(missingWriteItems.details.error, "invalid parameters");
+			const current = await todoTool.execute("call", { action: "get", id: "t1" }, null, null, ctx);
+			assert.equal(current.details.item.status, "pending");
+			assert.match(readFileSync(join(cwd, ".pi", "pi-todo.md"), "utf8"), /- \[ \] t1: Do work/);
+			await todoTool.execute("call", { action: "set_status", id: "t1", status: "in_progress" }, null, null, ctx);
+			await todoTool.execute("call", { action: "write", items: [{ id: "t2", headline: "Next task", status: "in_progress" }] }, null, null, ctx);
+			const previous = await todoTool.execute("call", { action: "get", id: "t1" }, null, null, ctx);
+			const active = await todoTool.execute("call", { action: "get", id: "t2" }, null, null, ctx);
+			assert.equal(previous.details.item.status, "pending");
+			assert.equal(active.details.item.status, "in_progress");
+
+			for (const line of overlay.render(30)) assert.equal(visibleWidth(line), 30);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
 	});
 });
 

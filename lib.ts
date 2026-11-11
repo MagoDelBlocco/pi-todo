@@ -43,6 +43,26 @@ export const DEFAULT_CONFIG: TodoConfig = {
 
 // ─── Serialize ────────────────────────────────────────────────────────────────
 
+// Keep ordinary values readable, but encode line breaks so a value cannot turn
+// into another todo or detail line when the file is loaded again.
+const ENCODED_VALUE_PREFIX = "@pi-todo-json:";
+
+function encodeValue(value: string): string {
+	return /[\r\n]/.test(value) || value.startsWith(ENCODED_VALUE_PREFIX)
+		? ENCODED_VALUE_PREFIX + JSON.stringify(value)
+		: value;
+}
+
+function decodeValue(value: string): string {
+	if (!value.startsWith(ENCODED_VALUE_PREFIX)) return value;
+	try {
+		const decoded: unknown = JSON.parse(value.slice(ENCODED_VALUE_PREFIX.length));
+		return typeof decoded === "string" ? decoded : value;
+	} catch {
+		return value;
+	}
+}
+
 /**
  * Serialize a TodoList to markdown.
  */
@@ -50,29 +70,32 @@ export function serializeTodoList(list: TodoList): string {
 	const lines: string[] = ["# Todo List", ""];
 
 	for (const item of list.items) {
+		if (!/^\S+$/.test(item.id)) {
+			throw new Error(`Invalid todo ID: ${item.id}`);
+		}
 		const marker =
 			item.status === "completed"
 				? "[x]"
 				: item.status === "in_progress"
 					? "[>]"
 					: "[ ]";
-		lines.push(`- ${marker} ${item.id}: ${item.headline}`);
+		lines.push(`- ${marker} ${item.id}: ${encodeValue(item.headline)}`);
 
 		if (item.detail) {
 			const d = item.detail;
 			if (d.definitionOfDone)
-				lines.push(`  - definitionOfDone: ${d.definitionOfDone}`);
+				lines.push(`  - definitionOfDone: ${encodeValue(d.definitionOfDone)}`);
 			if (d.constraints?.length) {
-				for (const c of d.constraints) lines.push(`  - constraints: ${c}`);
+				for (const c of d.constraints) lines.push(`  - constraints: ${encodeValue(c)}`);
 			}
 			if (d.refs?.length) {
-				for (const r of d.refs) lines.push(`  - refs: ${r}`);
+				for (const r of d.refs) lines.push(`  - refs: ${encodeValue(r)}`);
 			}
 			if (d.deps?.length) {
-				for (const dep of d.deps) lines.push(`  - deps: ${dep}`);
+				for (const dep of d.deps) lines.push(`  - deps: ${encodeValue(dep)}`);
 			}
-			if (d.rationale) lines.push(`  - rationale: ${d.rationale}`);
-			if (d.nextStep) lines.push(`  - nextStep: ${d.nextStep}`);
+			if (d.rationale) lines.push(`  - rationale: ${encodeValue(d.rationale)}`);
+			if (d.nextStep) lines.push(`  - nextStep: ${encodeValue(d.nextStep)}`);
 		}
 		lines.push("");
 	}
@@ -106,7 +129,7 @@ export function parseTodoList(content: string): TodoList {
 						: "pending";
 			current = {
 				id: itemMatch[2],
-				headline: itemMatch[3],
+				headline: decodeValue(itemMatch[3]),
 				status,
 				detail: {},
 			};
@@ -118,7 +141,7 @@ export function parseTodoList(content: string): TodoList {
 			const detailMatch = line.match(/^\s+-\s+(\w+):\s+(.+)$/);
 			if (detailMatch) {
 				const key = detailMatch[1] as keyof TodoDetail;
-				const value = detailMatch[2];
+				const value = decodeValue(detailMatch[2]);
 				if (!current.detail) current.detail = {};
 				if (key === "constraints" || key === "refs" || key === "deps") {
 					const arr = current.detail[key] as string[] | undefined;
