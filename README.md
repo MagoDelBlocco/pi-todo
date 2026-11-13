@@ -73,7 +73,7 @@ Markers: `[ ]` = pending, `[>]` = in_progress, `[x]` = completed.
 
 ## Plan approval
 
-New plans and full replacements open a temporary, scrollable review dialog. Press `A` to approve, `R` to request changes, or `Esc` to reject. Requested changes are returned to the agent; unapproved plans are not saved. Routine item updates and status changes do not reopen the dialog. In clients without a custom TUI, the extension uses a select/input dialog; without interactive UI, it reports that approval is unavailable.
+New plans and full replacements open a temporary review dialog with three choices: Approve plan, Request changes, and Reject plan. Use `↑`/`↓` to choose and `Enter` to select. Use `PageUp`/`PageDown` to scroll the plan preview; `Esc` cancels without saving. Requested changes are returned to the agent; unapproved plans are not saved. Routine item updates and status changes do not reopen the dialog. In clients without a custom TUI, the extension uses a select/input dialog; without interactive UI, it reports that approval is unavailable.
 
 ## Testing
 

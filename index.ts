@@ -113,10 +113,11 @@ type PlanDecision = "approve" | "revise" | "reject";
 class PlanApproval implements Component {
 	private scroll = 0;
 	private maxScroll = 0;
+	private pageSize = 1;
 	private preview: string;
 	private tui: TUI;
 	private theme: Theme;
-	private done: (decision: PlanDecision) => void;
+	private choices: SelectList;
 
 	constructor(
 		preview: string,
@@ -127,15 +128,36 @@ class PlanApproval implements Component {
 		this.preview = preview;
 		this.tui = tui;
 		this.theme = theme;
-		this.done = done;
+		this.choices = new SelectList(
+			[
+				{ value: "approve", label: "Approve plan" },
+				{ value: "revise", label: "Request changes" },
+				{ value: "reject", label: "Reject plan" },
+			],
+			3,
+			{
+				selectedPrefix: (text) => theme.fg("accent", text),
+				selectedText: (text) => theme.fg("accent", text),
+				description: (text) => theme.fg("muted", text),
+				scrollInfo: (text) => theme.fg("dim", text),
+				noMatch: (text) => theme.fg("warning", text),
+			},
+		);
+		this.choices.onSelect = (item) => done(item.value as PlanDecision);
+		this.choices.onCancel = () => done("reject");
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.choices.invalidate();
+	}
 
 	render(width: number): string[] {
 		const innerWidth = Math.max(1, width - 4);
 		const content = wrapTextWithAnsi(this.preview, innerWidth);
-		const visibleRows = Math.max(3, Math.floor(this.tui.terminal.rows * 0.8) - 5);
+		const availableRows = Math.max(5, Math.floor((this.tui.terminal.rows - 2) * 0.85));
+		const showHelp = availableRows >= 9;
+		const visibleRows = Math.max(0, availableRows - (showHelp ? 8 : 5));
+		this.pageSize = Math.max(1, visibleRows - 1);
 		this.maxScroll = Math.max(0, content.length - visibleRows);
 		this.scroll = Math.min(this.scroll, this.maxScroll);
 		const border = (text: string) => this.theme.fg("borderMuted", text);
@@ -146,18 +168,20 @@ class PlanApproval implements Component {
 		for (const line of content.slice(this.scroll, this.scroll + visibleRows)) {
 			lines.push(row(line));
 		}
-		lines.push(row(`↑↓ scroll  ${this.scroll + 1}-${Math.min(content.length, this.scroll + visibleRows)}/${content.length}`));
-		lines.push(row(this.theme.fg("accent", "A Approve   R Request changes   Esc Reject")));
+		if (showHelp) {
+			lines.push(row(`Plan ${this.scroll + 1}-${Math.min(content.length, this.scroll + visibleRows)}/${content.length}  •  PageUp/PageDown scroll`));
+			lines.push(row("Choose an action:"));
+		}
+		for (const line of this.choices.render(innerWidth)) lines.push(row(line));
+		if (showHelp) lines.push(row(this.theme.fg("dim", "↑↓ choose  •  Enter select  •  Esc cancel")));
 		lines.push(border("╰" + "─".repeat(Math.max(0, width - 2)) + "╯"));
 		return lines;
 	}
 
 	handleInput(data: string): void {
-		if (matchesKey(data, "a")) this.done("approve");
-		else if (matchesKey(data, "r")) this.done("revise");
-		else if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) this.done("reject");
-		else if (matchesKey(data, "up")) this.scroll = Math.max(0, this.scroll - 1);
-		else if (matchesKey(data, "down")) this.scroll = Math.min(this.maxScroll, this.scroll + 1);
+		if (matchesKey(data, "pageup")) this.scroll = Math.max(0, this.scroll - this.pageSize);
+		else if (matchesKey(data, "pagedown")) this.scroll = Math.min(this.maxScroll, this.scroll + this.pageSize);
+		else this.choices.handleInput(data);
 		this.tui.requestRender();
 	}
 }

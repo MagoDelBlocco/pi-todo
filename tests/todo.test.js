@@ -265,7 +265,10 @@ describe("extension integration", () => {
 						approvalCount++;
 						return new Promise((resolve) => {
 							approvalDialog = factory({ terminal: { rows: 30 }, requestRender() {} }, theme, null, resolve);
-							approvalDialog.handleInput(approvalChoice === "approve" ? "a" : approvalChoice === "revise" ? "r" : "\x1b");
+							approvalDialog.render(61);
+							if (approvalChoice !== "approve") approvalDialog.handleInput("\x1b[B");
+							if (approvalChoice === "reject") approvalDialog.handleInput("\x1b[B");
+							approvalDialog.handleInput("\r");
 						});
 					},
 					input: async () => "Please shorten the plan",
@@ -330,6 +333,9 @@ describe("extension integration", () => {
 			for (const width of [30, 61]) {
 				const lines = approvalDialog.render(width);
 				if (width === 61) assert.ok(lines.some((line) => line.includes("definitionOfDone: Reviewed")));
+				assert.ok(lines.some((line) => line.includes("Approve plan")));
+				assert.ok(lines.some((line) => line.includes("Request changes")));
+				assert.ok(lines.some((line) => line.includes("Reject plan")));
 				assert.match(lines[0], /^╭─ Review proposed todo plan ─*╮$/);
 				assert.match(lines.at(-1), /^╰─+╯$/);
 				for (const line of lines) assert.equal(visibleWidth(line), width);
