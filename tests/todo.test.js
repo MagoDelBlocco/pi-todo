@@ -240,12 +240,15 @@ describe("round-trip (serialize → parse)", () => {
 });
 
 describe("extension integration", () => {
-	it("recites on every context call, validates inputs, and switches the active item", async () => {
+	it("approves new plans, recites them, and switches the active item", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-todo-test-"));
 		try {
 			const handlers = new Map();
 			let todoTool;
-			let overlay;
+			let approvalDialog;
+			let approvalChoice = "approve";
+			let approvalCount = 0;
+			let statusText;
 			const pi = {
 				on(name, handler) { handlers.set(name, handler); },
 				registerTool(tool) { todoTool = tool; },
@@ -258,15 +261,29 @@ describe("extension integration", () => {
 				hasUI: true,
 				ui: {
 					theme: { ...theme, bg: (_color, text) => text },
-					custom(factory, options) {
-						overlay = factory({ requestRender() {} }, theme, null, () => {});
-						options?.onHandle?.({ hide() {} });
+					custom(factory) {
+						approvalCount++;
+						return new Promise((resolve) => {
+							approvalDialog = factory({ terminal: { rows: 30 }, requestRender() {} }, theme, null, resolve);
+							approvalDialog.handleInput(approvalChoice === "approve" ? "a" : approvalChoice === "revise" ? "r" : "\x1b");
+						});
 					},
-					setStatus() {},
+					input: async () => "Please shorten the plan",
+					setStatus(_key, text) { statusText = text; },
 				},
 			};
 			await handlers.get("session_start")({}, ctx);
+			approvalChoice = "reject";
+			const rejected = await todoTool.execute("call", { action: "write", items: [{ id: "t1", headline: "Do work" }] }, null, null, ctx);
+			assert.equal(rejected.details.approval, "reject");
+			assert.equal(await todoTool.execute("call", { action: "list" }, null, null, ctx).then((r) => r.content[0].text), "No todos");
+			approvalChoice = "revise";
+			const revision = await todoTool.execute("call", { action: "write", items: [{ id: "t1", headline: "Do work" }] }, null, null, ctx);
+			assert.match(revision.content[0].text, /Please shorten the plan/);
+			approvalChoice = "approve";
 			await todoTool.execute("call", { action: "write", items: [{ id: "t1", headline: "Do work" }] }, null, null, ctx);
+			assert.equal(approvalCount, 3);
+			assert.match(statusText, /todo/);
 
 			const event = { messages: [{ role: "user", content: [{ type: "text", text: "Do it" }], timestamp: 1 }] };
 			for (let call = 0; call < 2; call++) {
@@ -291,10 +308,29 @@ describe("extension integration", () => {
 			const active = await todoTool.execute("call", { action: "get", id: "t2" }, null, null, ctx);
 			assert.equal(previous.details.item.status, "pending");
 			assert.equal(active.details.item.status, "in_progress");
+			assert.equal(approvalCount, 3, "routine writes and status updates do not prompt again");
+			assert.match(statusText, /t2/);
+			approvalChoice = "reject";
+			const replacement = await todoTool.execute("call", {
+				action: "write", replaceAll: true,
+				items: [{ id: "t3", headline: "Replacement", detail: { definitionOfDone: "Reviewed" } }],
+			}, null, null, ctx);
+			assert.equal(replacement.details.approval, "reject");
+			assert.equal(approvalCount, 4);
+			assert.equal((await todoTool.execute("call", { action: "get", id: "t2" }, null, null, ctx)).details.item.status, "in_progress");
+			assert.match(readFileSync(join(cwd, ".pi", "pi-todo.md"), "utf8"), /t2: Next task/);
+			assert.match(statusText, /t2/);
+			const headless = await todoTool.execute("call", {
+				action: "write", replaceAll: true,
+				items: [{ id: "t4", headline: "Headless replacement" }],
+			}, null, null, { ...ctx, hasUI: false });
+			assert.equal(headless.details.approval, "unavailable");
+			assert.equal(approvalCount, 4);
 
 			for (const width of [30, 61]) {
-				const lines = overlay.render(width);
-				assert.match(lines[0], /^╭─ TODO ─+╮$/);
+				const lines = approvalDialog.render(width);
+				if (width === 61) assert.ok(lines.some((line) => line.includes("definitionOfDone: Reviewed")));
+				assert.match(lines[0], /^╭─ Review proposed todo plan ─*╮$/);
 				assert.match(lines.at(-1), /^╰─+╯$/);
 				for (const line of lines) assert.equal(visibleWidth(line), width);
 			}

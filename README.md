@@ -9,7 +9,7 @@ pi-todo gives the agent a reliable planning surface with two views:
 1. **Recited list** — compact overview injected into context every turn so the agent always knows what it's working on
 2. **Per-item detail** — full agent-facing notes (definition of done, constraints, refs, deps, rationale, next step) addressable by ID
 
-It also shows a persistent top-right overlay panel in the TUI that auto-hides when there are no todos.
+When the agent proposes a new plan, an interactive dialog lets you review and approve it, request changes, or reject it. The active item remains visible in the status bar.
 
 ## Tool
 
@@ -17,7 +17,7 @@ A single `todo` tool exposes four actions via the `action` parameter:
 
 | Action | Description |
 |--------|-------------|
-| `write` | Create or update todo items. Pass `replaceAll: true` to replace the entire list |
+| `write` | Create or update todo items. Creating a list or using `replaceAll: true` requires plan approval. |
 | `set_status` | Change an item's status (`pending` → `in_progress` → `completed`). Enforces single `in_progress` invariant |
 | `get` | Fetch full detail of a single item by ID |
 | `list` | Show compact list without detail |
@@ -46,8 +46,8 @@ When `strictDeps` is enabled (default: `false`), setting an item to `in_progress
 
 | Command | Description |
 |---------|-------------|
-| `/todo` | Show todo list overlay |
-| `/todo list` | Show todo list overlay |
+| `/todo` | Show todo list |
+| `/todo list` | Show todo list |
 | `/todo detail` | Select and view full detail of an item |
 | `/todo clear` | Clear all todos (with confirmation) |
 
@@ -71,15 +71,9 @@ Todos are stored in `.pi/pi-todo.md` (project-local markdown file). When all ite
 
 Markers: `[ ]` = pending, `[>]` = in_progress, `[x]` = completed.
 
-## Overlay
+## Plan approval
 
-A non-capturing overlay panel renders in the top-right corner showing:
-
-- Completion counter (e.g. `2/5`)
-- All items with status icons (`○` pending, `▶` in_progress, `✅` completed)
-- Auto-hides when the list is empty
-
-The overlay uses `nonCapturing: true` so it doesn't steal keyboard focus from the chatbox.
+New plans and full replacements open a temporary, scrollable review dialog. Press `A` to approve, `R` to request changes, or `Esc` to reject. Requested changes are returned to the agent; unapproved plans are not saved. Routine item updates and status changes do not reopen the dialog. In clients without a custom TUI, the extension uses a select/input dialog; without interactive UI, it reports that approval is unavailable.
 
 ## Testing
 

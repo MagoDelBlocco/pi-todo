@@ -6,7 +6,7 @@
  *  2. Per-item detail (addressable via todo_get, full detail only for in_progress)
  *
  * Persistence: .pi/pi-todo.md (project-local markdown file).
- * UI: persistent top-right overlay panel (auto-shows/hides with todo state).
+ * UI: plan approval dialog on creation, plus an active-item status indicator.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -35,12 +35,11 @@ import {
 	type Component,
 	truncateToWidth,
 	visibleWidth,
-	type OverlayHandle,
 	type TUI,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import {
-	type TodoItem,
 	type TodoList,
 	type TodoConfig,
 	DEFAULT_CONFIG,
@@ -107,85 +106,59 @@ function retireTodoList(cwd: string): void {
 	unlinkSync(todoPath);
 }
 
-// ─── Persistent Overlay Component ─────────────────────────────────────────────
+// ─── Temporary approval dialog ───────────────────────────────────────────────
 
-/**
- * Compact todo panel rendered as a right-anchored overlay.
- * Auto-hides when there are no todos.
- */
-class TodoOverlay implements Component {
-	private items: TodoItem[];
+type PlanDecision = "approve" | "revise" | "reject";
+
+class PlanApproval implements Component {
+	private scroll = 0;
+	private maxScroll = 0;
+	private preview: string;
+	private tui: TUI;
 	private theme: Theme;
-	private cachedWidth?: number;
-	private cachedLines?: string[];
+	private done: (decision: PlanDecision) => void;
 
-	constructor(items: TodoItem[], theme: Theme) {
-		this.items = items;
+	constructor(
+		preview: string,
+		tui: TUI,
+		theme: Theme,
+		done: (decision: PlanDecision) => void,
+	) {
+		this.preview = preview;
+		this.tui = tui;
 		this.theme = theme;
+		this.done = done;
 	}
 
-	/** Update items in-place (avoids recreating the component) */
-	update(items: TodoItem[]): void {
-		this.items = items;
-		this.invalidate();
-	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
+	invalidate(): void {}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
-			return this.cachedLines;
+		const innerWidth = Math.max(1, width - 4);
+		const content = wrapTextWithAnsi(this.preview, innerWidth);
+		const visibleRows = Math.max(3, Math.floor(this.tui.terminal.rows * 0.8) - 5);
+		this.maxScroll = Math.max(0, content.length - visibleRows);
+		this.scroll = Math.min(this.scroll, this.maxScroll);
+		const border = (text: string) => this.theme.fg("borderMuted", text);
+		const row = (text: string) =>
+			border("│ ") + truncateToWidth(text, innerWidth, "", true) + border(" │");
+		const title = " Review proposed todo plan ";
+		const lines = [border("╭─" + title + "─".repeat(Math.max(0, width - visibleWidth("╭─" + title + "╮"))) + "╮")];
+		for (const line of content.slice(this.scroll, this.scroll + visibleRows)) {
+			lines.push(row(line));
 		}
-
-		const th = this.theme;
-		const lines: string[] = [];
-
-		// Top border with title
-		const topLeft = th.fg("borderMuted", "╭─");
-		const title = th.fg("accent", " TODO ");
-		const topRight = th.fg("borderMuted", "╮");
-		const remaining = Math.max(0, width - visibleWidth(topLeft + title + topRight));
-		lines.push(
-			topLeft + title + th.fg("borderMuted", "─".repeat(remaining)) + topRight,
-		);
-
-		const done = this.items.filter((i) => i.status === "completed").length;
-		const total = this.items.length;
-		lines.push(
-			th.fg("borderMuted", "│ ") +
-				th.fg("dim", truncateToWidth(`${done}/${total}`, width - 4, "", true)) +
-				th.fg("borderMuted", " │"),
-		);
-
-		for (const item of this.items) {
-			const icon =
-				item.status === "completed"
-					? th.fg("success", "✅")
-					: item.status === "in_progress"
-						? th.fg("accent", "▶")
-						: th.fg("dim", "○");
-			const id = th.fg("accent", item.id);
-			const text =
-				item.status === "completed"
-					? th.fg("dim", item.headline)
-					: th.fg("text", item.headline);
-			const line = `${icon} ${id} ${text}`;
-			const padded = truncateToWidth(line, width - 4, "", true);
-			lines.push(
-				th.fg("borderMuted", "│ ") + padded + th.fg("borderMuted", " │"),
-			);
-		}
-
-		// Bottom border
-		const bottomInner = Math.max(0, width - 2);
-		lines.push(th.fg("borderMuted", "╰" + "─".repeat(bottomInner) + "╯"));
-
-		this.cachedWidth = width;
-		this.cachedLines = lines;
+		lines.push(row(`↑↓ scroll  ${this.scroll + 1}-${Math.min(content.length, this.scroll + visibleRows)}/${content.length}`));
+		lines.push(row(this.theme.fg("accent", "A Approve   R Request changes   Esc Reject")));
+		lines.push(border("╰" + "─".repeat(Math.max(0, width - 2)) + "╯"));
 		return lines;
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, "a")) this.done("approve");
+		else if (matchesKey(data, "r")) this.done("revise");
+		else if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) this.done("reject");
+		else if (matchesKey(data, "up")) this.scroll = Math.max(0, this.scroll - 1);
+		else if (matchesKey(data, "down")) this.scroll = Math.min(this.maxScroll, this.scroll + 1);
+		this.tui.requestRender();
 	}
 }
 
@@ -195,11 +168,6 @@ export default function (pi: ExtensionAPI) {
 	let todoList: TodoList = { items: [] };
 	const config: TodoConfig = { ...DEFAULT_CONFIG };
 	let cwd: string = "";
-
-	// Persistent overlay state
-	let overlayHandle: OverlayHandle | null = null;
-	let overlayTui: TUI | null = null;
-	let overlayComponent: TodoOverlay | null = null;
 
 	/** Load from file and set in-memory state */
 	const loadState = (ctx: ExtensionContext) => {
@@ -212,41 +180,43 @@ export default function (pi: ExtensionAPI) {
 		if (cwd) saveTodoList(cwd, todoList);
 	};
 
-	/** Refresh the overlay panel with current state. Creates it if needed. */
-	const refreshOverlay = (ctx?: ExtensionContext) => {
-		if (todoList.items.length === 0) {
-			if (overlayHandle) {
-				overlayHandle.hide();
-				overlayHandle = null;
-			}
-			overlayTui = null;
-			overlayComponent = null;
-		} else if (overlayComponent && overlayTui) {
-			// Overlay exists — update in place
-			overlayComponent.update(todoList.items);
-			overlayTui.requestRender();
-		} else if (ctx && ctx.hasUI) {
-			// No overlay yet — create one
-			ctx.ui.custom<void>(
-				(tui, theme, _kb, _done) => {
-					overlayTui = tui;
-					overlayComponent = new TodoOverlay(todoList.items, theme);
-					return overlayComponent;
+	const approvePlan = async (
+		ctx: ExtensionContext,
+		preview: string,
+		signal?: AbortSignal,
+	): Promise<PlanDecision | undefined> => {
+		if (!ctx.hasUI || signal?.aborted) return undefined;
+		let removeAbortListener: (() => void) | undefined;
+		try {
+			const result = await ctx.ui.custom<PlanDecision>(
+				(tui, theme, _kb, done) => {
+					const onAbort = () => done("reject");
+					signal?.addEventListener("abort", onAbort, { once: true });
+					removeAbortListener = () => signal?.removeEventListener("abort", onAbort);
+					return new PlanApproval(preview, tui, theme, done);
 				},
 				{
 					overlay: true,
 					overlayOptions: {
-						anchor: "top-right" as const,
-						width: "40%",
-						minWidth: 30,
+						anchor: "center",
+						width: "70%",
+						minWidth: 50,
+						maxHeight: "85%",
 						margin: 1,
-						nonCapturing: true,
-					},
-					onHandle: (handle) => {
-						overlayHandle = handle;
 					},
 				},
 			);
+			if (result !== undefined) return signal?.aborted ? undefined : result;
+			// RPC clients can implement select/input while custom components are unavailable.
+			const choice = await ctx.ui.select(
+				`Review proposed todo plan\n\n${preview}`,
+				["Approve", "Request changes", "Reject"],
+				{ signal },
+			);
+			if (signal?.aborted) return undefined;
+			return choice === "Approve" ? "approve" : choice === "Request changes" ? "revise" : "reject";
+		} finally {
+			removeAbortListener?.();
 		}
 	};
 
@@ -256,19 +226,11 @@ export default function (pi: ExtensionAPI) {
 		loadState(ctx);
 		enforceSingleInProgress(todoList);
 
-		// Show persistent overlay + status indicator if there are todos.
-		refreshOverlay(ctx);
-		if (todoList.items.length > 0) updateStatusIndicator(ctx);
+		updateStatusIndicator(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		if (cwd) saveState();
-		if (overlayHandle) {
-			overlayHandle.hide();
-			overlayHandle = null;
-		}
-		overlayTui = null;
-		overlayComponent = null;
 	});
 
 	// ─── Recitation before every model call ─────────────────────────────────
@@ -338,7 +300,6 @@ export default function (pi: ExtensionAPI) {
 				.join("\n");
 			retireTodoList(cwd);
 			todoList = { items: [] };
-			refreshOverlay(ctx);
 			ctx.ui.setStatus("pi-todo", undefined);
 			return {
 				content: [
@@ -365,6 +326,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Manage persistent todo list for multi-step tasks",
 		promptGuidelines: [
 			"Use todo with action 'write' to create a plan before starting multi-step work. Fill definitionOfDone for every item.",
+			"New plans and full replacements require user approval. If the user requests changes, revise the proposal and submit it again before acting on it.",
 			"Use todo with action 'set_status' to move items between pending, in_progress, and completed. Only one item may be in_progress at a time.",
 			"Use todo with action 'get' to fetch full detail of a specific item by ID when you need the agent-facing notes.",
 			"Use todo with action 'list' to see the compact list without detail.",
@@ -437,7 +399,7 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { action } = params;
 			const invalidParams = (message: string) => ({
 				content: [{ type: "text" as const, text: message }],
@@ -452,19 +414,19 @@ export default function (pi: ExtensionAPI) {
 						return invalidParams(`Invalid todo ID: ${item.id}`);
 					}
 				}
-				if (params.replaceAll) {
-					todoList = { items: [] };
-				}
+				const proposed: TodoList = params.replaceAll
+					? { items: [] }
+					: structuredClone(todoList);
 
 				for (const newItem of params.items ?? []) {
 					if (newItem.status === "in_progress") {
-						for (const item of todoList.items) {
+						for (const item of proposed.items) {
 							if (item.id !== newItem.id && item.status === "in_progress") {
 								item.status = "pending";
 							}
 						}
 					}
-					const existing = todoList.items.find((i) => i.id === newItem.id);
+					const existing = proposed.items.find((i) => i.id === newItem.id);
 					if (existing) {
 						if (newItem.headline) existing.headline = newItem.headline;
 						if (newItem.status) existing.status = newItem.status;
@@ -472,7 +434,7 @@ export default function (pi: ExtensionAPI) {
 							existing.detail = { ...existing.detail, ...newItem.detail };
 						}
 					} else {
-						todoList.items.push({
+						proposed.items.push({
 							id: newItem.id,
 							headline: newItem.headline,
 							status: newItem.status ?? "pending",
@@ -481,9 +443,32 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
-				enforceSingleInProgress(todoList);
+				enforceSingleInProgress(proposed);
+				if (proposed.items.length > 0 && (todoList.items.length === 0 || params.replaceAll)) {
+					if (!ctx.hasUI) {
+						return {
+							content: [{ type: "text", text: "Plan approval requires an interactive UI; no changes were saved." }],
+							isError: true,
+							details: { approval: "unavailable" },
+						};
+					}
+					onUpdate?.({ content: [{ type: "text", text: "Waiting for plan approval..." }] });
+					const decision = await approvePlan(ctx, serializeTodoList(proposed), signal);
+					if (decision !== "approve") {
+						const feedback = decision === "revise"
+							? await ctx.ui.input("What should the agent change in the plan?", "Describe the changes...", { signal })
+							: undefined;
+						const message = decision === "revise"
+							? `User requested changes to the plan${feedback?.trim() ? `: ${feedback.trim()}` : ". Ask for specific feedback before trying again."}`
+							: "Plan was not approved. No changes were saved.";
+						return {
+							content: [{ type: "text", text: message }],
+							details: { approval: decision ?? "cancelled", feedback: feedback?.trim() },
+						};
+					}
+				}
+				todoList = proposed;
 				saveState();
-				refreshOverlay(ctx);
 
 				// A write can complete the final item just as set_status can.
 				const retiredAfterWrite = handleRetire(ctx);
@@ -559,7 +544,6 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				saveState();
-				refreshOverlay(ctx);
 
 				const retired = handleRetire(ctx);
 				if (retired) return retired;
@@ -680,15 +664,19 @@ export default function (pi: ExtensionAPI) {
 				if (ok) {
 					todoList = { items: [] };
 					saveState();
-					refreshOverlay(ctx);
 					ctx.ui.setStatus("pi-todo", undefined);
 					ctx.ui.notify("Todos cleared", "info");
 				}
 				return;
 			}
 
-			if (args === "detail" || args === "list") {
-				await showTodoDetail(ctx, args === "detail");
+			if (args === "detail") {
+				await showTodoDetail(ctx);
+				return;
+			}
+
+			if (args === "list") {
+				await showTodoList(ctx);
 				return;
 			}
 
@@ -765,7 +753,7 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	async function showTodoDetail(ctx: ExtensionContext, _showAll: boolean) {
+	async function showTodoDetail(ctx: ExtensionContext) {
 		if (todoList.items.length === 0) {
 			ctx.ui.notify("No todos", "info");
 			return;
